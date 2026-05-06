@@ -18,7 +18,6 @@ def make_webhook_app(
     app = web.Application()
 
     async def handle_callback(request: web.Request) -> web.Response:
-        # Проверка подписи
         req_merchant = request.headers.get("X-MerchantId", "")
         req_secret = request.headers.get("X-Secret", "")
         if req_merchant != merchant_id or req_secret != secret:
@@ -33,9 +32,9 @@ def make_webhook_app(
             logger.error("Platega callback: ошибка парсинга JSON: %s", exc)
             return web.Response(status=400, text="Bad JSON")
 
-        transaction_id = str(data.get("transactionId", ""))
-        status = str(data.get("status", ""))
-        payload = str(data.get("payload", ""))
+        transaction_id = str(data.get("transactionId") or data.get("id") or "")
+        status = str(data.get("status") or "")
+        payload = str(data.get("payload") or "")
 
         logger.info("Platega callback: transactionId=%s status=%s", transaction_id, status)
 

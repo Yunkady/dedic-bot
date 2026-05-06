@@ -50,7 +50,7 @@ WELCOME_TEXT = (
     "пополнить внутренний баланс и отслеживать статус выдачи.\n\n"
     "✨ <b>Что можно сделать:</b>\n"
     "• 🌍 выбрать страну и подходящий тариф;\n"
-    "• 💰 оплатить заказ с баланса или банковской картой;\n"
+    "• 💰 оплатить заказ с баланса;\n"
     "• 🖥 смотреть свои заказы и получать данные доступа после выдачи;\n"
     "• 💬 написать в поддержку, если нужна помощь.\n\n"
     "Перед оплатой загляните в <b>«📚 Документы и поддержка»</b> — там политика "
@@ -220,10 +220,7 @@ def offers_keyboard(country_code: str) -> InlineKeyboardBuilder:
     return builder
 
 
-def payment_keyboard(payment_id: str, amount_rub: int, pay_url: str | None = None) -> InlineKeyboardBuilder:
-    """
-    pay_url — ссылка на страницу Platega (если None — Platega не настроена).
-    """
+def order_payment_keyboard(payment_id: str, amount_rub: int) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.add(
         InlineKeyboardButton(
@@ -231,27 +228,27 @@ def payment_keyboard(payment_id: str, amount_rub: int, pay_url: str | None = Non
             callback_data=f"paybalance:{payment_id}",
         )
     )
-    if pay_url:
-        builder.add(
-            InlineKeyboardButton(
-                text="💳 Оплатить картой",
-                url=pay_url,
-            )
-        )
     builder.add(InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home"))
     builder.adjust(1)
     return builder
 
 
-def topup_keyboard(needed: int) -> InlineKeyboardBuilder:
-    """Клавиатура при нехватке баланса — кнопка пополнения на нужную сумму."""
+def shortage_keyboard(needed: int) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.add(
         InlineKeyboardButton(
-            text=f"➕ Пополнить баланс (не хватает {needed} ₽)",
-            callback_data="balance:topup",
+            text=f"⚠️ Недостаточно средств, пополнить баланс ({needed} ₽)",
+            callback_data=f"balance:topup:{needed}",
         )
     )
+    builder.add(InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home"))
+    builder.adjust(1)
+    return builder
+
+
+def topup_link_keyboard(pay_url: str) -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text="💳 Открыть платёж", url=pay_url))
     builder.add(InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home"))
     builder.adjust(1)
     return builder
@@ -287,6 +284,48 @@ def balance_text(storage: Storage, user_id: int) -> str:
                 f"(баланс: {tx.balance_after_rub} ₽)"
             )
     return "\n".join(lines)
+
+
+def _short_button(text: str, limit: int = 64) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+async def _create_topup_link(
+    *,
+    amount_rub: int,
+    user_id: int,
+    username: str | None,
+    settings: Settings,
+    storage: Storage,
+) -> tuple[str, str]:
+    if not settings.platega_merchant_id or not settings.platega_secret:
+        raise RuntimeError("Platega не настроена")
+
+    topup_id = f"topup-{uuid.uuid4().hex[:12]}"
+    client = PlategaClient(settings.platega_merchant_id, settings.platega_secret)
+    link = await client.create_payment(
+        amount_rub=amount_rub,
+        description=f"Пополнение баланса #{topup_id}",
+        return_url=settings.platega_return_url,
+        failed_url=settings.platega_failed_url,
+        payload=topup_id,
+    )
+    if not link.transaction_id:
+        raise RuntimeError("Platega не вернула transactionId")
+    if not link.redirect:
+        raise RuntimeError("Platega не вернула redirect-ссылку")
+
+    storage.create_balance_topup(
+        topup_id=topup_id,
+        user_id=user_id,
+        username=username,
+        amount_rub=amount_rub,
+        platega_transaction_id=link.transaction_id,
+        status="waiting_payment",
+    )
+    return topup_id, link.redirect
 
 
 @router.message(CommandStart())
@@ -408,6 +447,48 @@ async def ask_topup_amount(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("balance:topup:"))
+async def start_topup_from_shortage(
+    callback: CallbackQuery,
+    storage: Storage,
+    settings: Settings,
+) -> None:
+    try:
+        needed = int(callback.data.split(":")[2])
+    except Exception:
+        await callback.answer("Некорректная сумма", show_alert=True)
+        return
+
+    if needed <= 0:
+        await callback.answer("Некорректная сумма", show_alert=True)
+        return
+
+    try:
+        _, pay_url = await _create_topup_link(
+            amount_rub=needed,
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            settings=settings,
+            storage=storage,
+        )
+    except Exception as exc:
+        logging.exception("Не удалось создать платёж на пополнение: %s", exc)
+        await callback.message.edit_text(
+            "⚠️ Не удалось создать ссылку на пополнение.\n"
+            "Платёжная система сейчас недоступна или не настроена."
+        )
+        await callback.answer("Ошибка оплаты", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "💳 <b>Ссылка на пополнение создана</b>\n\n"
+        f"➕ <b>Сумма:</b> {needed} ₽\n"
+        "Откройте платёж и завершите оплату.",
+        reply_markup=topup_link_keyboard(pay_url).as_markup(),
+    )
+    await callback.answer()
+
+
 @router.message(BuyVmState.waiting_topup_amount)
 async def process_topup_amount(
     message: Message,
@@ -426,26 +507,27 @@ async def process_topup_amount(
         await message.answer("⚠️ Сумма должна быть от 100 до 50000 ₽.")
         return
 
-    new_balance = storage.add_user_balance(
-        message.from_user.id,
-        message.from_user.username,
-        amount_rub,
-        kind="topup",
-        note="manual_topup",
-    )
+    try:
+        _, pay_url = await _create_topup_link(
+            amount_rub=amount_rub,
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            settings=settings,
+            storage=storage,
+        )
+    except Exception as exc:
+        logging.exception("Не удалось создать платёж на пополнение: %s", exc)
+        await message.answer(
+            "⚠️ Не удалось создать ссылку на пополнение.\n"
+            "Платёжная система сейчас недоступна или не настроена."
+        )
+        return
+
     await state.set_state(BuyVmState.main_menu)
     await message.answer(
-        f"✅ Баланс пополнен на <b>{amount_rub}</b> ₽.\n"
-        f"💰 Текущий баланс: <b>{new_balance}</b> ₽.",
-        reply_markup=main_menu_keyboard().as_markup(),
-    )
-    await notify_balance_topup(
-        bot=bot,
-        settings=settings,
-        user_id=message.from_user.id,
-        username=message.from_user.username,
-        amount_rub=amount_rub,
-        new_balance=new_balance,
+        f"✅ Ссылка на пополнение на <b>{amount_rub}</b> ₽ создана.\n"
+        "Откройте платёж и завершите оплату.",
+        reply_markup=topup_link_keyboard(pay_url).as_markup(),
     )
 
 
@@ -453,18 +535,42 @@ async def process_topup_amount(
 async def show_my_servers(callback: CallbackQuery, state: FSMContext, storage: Storage) -> None:
     await state.set_state(BuyVmState.main_menu)
     orders = storage.list_user_orders(callback.from_user.id, limit=10)
+    current_balance = storage.get_user_balance(callback.from_user.id)
+
     if not orders:
         text = "🖥 <b>Мои серверы</b>\n\nПока нет заказов — загляните в «🛒 Купить сервер»."
-    else:
-        rows: list[str] = ["🖥 <b>Ваши серверы:</b>"]
-        for order in orders:
-            rows.append(
-                f"• #{order.order_id} | {order.country_name} | {order.vm_name} | "
-                f"{status_label(order.status)}"
-            )
-        text = "\n".join(rows)
+        await callback.message.edit_text(text, reply_markup=main_menu_keyboard().as_markup())
+        await callback.answer()
+        return
 
-    await callback.message.edit_text(text, reply_markup=main_menu_keyboard().as_markup())
+    rows: list[str] = ["🖥 <b>Ваши серверы:</b>\n"]
+    kb = InlineKeyboardBuilder()
+    for order in orders:
+        rows.append(
+            f"• #{order.order_id} | {order.country_name} | {order.vm_name} | "
+            f"{status_label(order.status)}"
+        )
+        if order.status == "waiting_payment":
+            needed = max(0, order.amount_rub - current_balance)
+            if needed == 0:
+                kb.add(
+                    InlineKeyboardButton(
+                        text=_short_button(f"💰 Оплатить #{order.order_id} с баланса ({order.amount_rub} ₽)"),
+                        callback_data=f"paybalance:{order.payment_id}",
+                    )
+                )
+            else:
+                kb.add(
+                    InlineKeyboardButton(
+                        text=_short_button(f"⚠️ Недостаточно средств для #{order.order_id} ({needed} ₽)"),
+                        callback_data=f"balance:topup:{needed}",
+                    )
+                )
+    kb.add(InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home"))
+    kb.adjust(1)
+
+    text = "\n".join(rows)
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
     await callback.answer()
 
 
@@ -516,6 +622,8 @@ async def offer_selected(
         await callback.answer("⚠️ Конфигурация недоступна", show_alert=True)
         return
 
+    storage.ensure_user(callback.from_user.id, callback.from_user.username)
+
     order_id = str(uuid.uuid4())[:8]
     vm_specs = (
         f"{offer.cpu} vCPU / {offer.ram_gb} GB RAM / "
@@ -541,31 +649,35 @@ async def offer_selected(
     )
     storage.create_order(order)
 
-    # Создаём платежную ссылку Platega (если настроена)
-    pay_url: str | None = None
-    if settings.platega_merchant_id and settings.platega_secret:
-        try:
-            client = PlategaClient(settings.platega_merchant_id, settings.platega_secret)
-            link = await client.create_payment(
-                amount_rub=offer.price_rub,
-                description=f"Заказ #{order_id} — {offer.name} ({COUNTRIES[country_code]})",
-                return_url=settings.platega_return_url,
-                failed_url=settings.platega_failed_url,
-                payload=payment_id,  # передаём наш payment_id чтобы сопоставить в callback
-            )
-            storage.set_platega_transaction_id(payment_id, link.transaction_id)
-            pay_url = link.url
-        except Exception as exc:
-            logging.warning("Platega create_payment failed: %s", exc)
+    current_balance = storage.get_user_balance(callback.from_user.id)
+    if current_balance >= order.amount_rub:
+        text = (
+            "🧾 <b>Заказ сформирован</b>\n\n"
+            f"📍 <b>Страна:</b> {order.country_name}\n"
+            f"📦 <b>Тариф:</b> {order.vm_name}\n"
+            f"⚙️ <b>Характеристики:</b> {order.vm_specs}\n"
+            f"💵 <b>Сумма:</b> {order.amount_rub} ₽\n"
+            f"💰 <b>Ваш баланс:</b> {current_balance} ₽\n\n"
+            "Оплата доступна с баланса."
+        )
+        kb = order_payment_keyboard(payment_id, order.amount_rub)
+    else:
+        needed = order.amount_rub - current_balance
+        text = (
+            "🧾 <b>Заказ сформирован</b>\n\n"
+            f"📍 <b>Страна:</b> {order.country_name}\n"
+            f"📦 <b>Тариф:</b> {order.vm_name}\n"
+            f"⚙️ <b>Характеристики:</b> {order.vm_specs}\n"
+            f"💵 <b>Сумма:</b> {order.amount_rub} ₽\n"
+            f"💰 <b>Ваш баланс:</b> {current_balance} ₽\n"
+            f"📉 <b>Не хватает:</b> {needed} ₽\n\n"
+            "Сначала пополните баланс."
+        )
+        kb = shortage_keyboard(needed)
 
     await callback.message.edit_text(
-        "🧾 <b>Заказ сформирован</b>\n\n"
-        f"📍 <b>Страна:</b> {order.country_name}\n"
-        f"📦 <b>Тариф:</b> {order.vm_name}\n"
-        f"⚙️ <b>Характеристики:</b> {order.vm_specs}\n"
-        f"💵 <b>Сумма:</b> {order.amount_rub} ₽\n\n"
-        "Выберите способ оплаты 👇",
-        reply_markup=payment_keyboard(payment_id, order.amount_rub, pay_url).as_markup(),
+        text,
+        reply_markup=kb.as_markup(),
     )
     await callback.answer()
 
@@ -599,7 +711,7 @@ async def pay_with_balance(
             f"💵 Стоимость заказа: <b>{order.amount_rub}</b> ₽\n"
             f"📉 Не хватает: <b>{needed}</b> ₽\n\n"
             "Пополните баланс и попробуйте снова.",
-            reply_markup=topup_keyboard(needed).as_markup(),
+            reply_markup=shortage_keyboard(needed).as_markup(),
         )
         await callback.answer()
         return
@@ -610,10 +722,17 @@ async def pay_with_balance(
         kind="purchase",
         note=f"order:{order.order_id}",
     ):
-        # Повторная проверка (race condition)
         current_balance = storage.get_user_balance(callback.from_user.id)
-        needed = order.amount_rub - current_balance
-        await callback.answer("⚠️ Недостаточно средств на балансе", show_alert=True)
+        needed = max(0, order.amount_rub - current_balance)
+        await callback.message.edit_text(
+            f"⚠️ <b>Недостаточно средств на балансе</b>\n\n"
+            f"💰 Ваш баланс: <b>{current_balance}</b> ₽\n"
+            f"💵 Стоимость заказа: <b>{order.amount_rub}</b> ₽\n"
+            f"📉 Не хватает: <b>{needed}</b> ₽\n\n"
+            "Пополните баланс и попробуйте снова.",
+            reply_markup=shortage_keyboard(needed).as_markup(),
+        )
+        await callback.answer()
         return
 
     storage.update_order_status(order.payment_id, "paid_waiting_provision")
@@ -742,61 +861,114 @@ async def main() -> None:
 
     async def on_platega_confirmed(transaction_id: str, payload: str) -> None:
         """Вызывается webhook-сервером при статусе CONFIRMED от Platega."""
-        # payload содержит наш payment_id (мы передали его при создании платежа)
         order = None
         if payload:
             order = storage_obj.get_order(payload)
         if order is None:
-            # Запасной вариант — ищем по platega_transaction_id
             order = storage_obj.get_order_by_platega_id(transaction_id)
-        if order is None:
-            logging.warning("Platega confirmed: заказ не найден (tid=%s, payload=%s)", transaction_id, payload)
-            return
-        if order.status != "waiting_payment":
-            logging.info("Platega confirmed: заказ %s уже обработан (status=%s)", order.payment_id, order.status)
+
+        if order is not None:
+            if order.status != "waiting_payment":
+                logging.info(
+                    "Platega confirmed: заказ %s уже обработан (status=%s)",
+                    order.payment_id,
+                    order.status,
+                )
+                return
+
+            storage_obj.update_order_status(order.payment_id, "paid_waiting_provision")
+            order = storage_obj.get_order(order.payment_id)
+            if order is None:
+                return
+
+            try:
+                await bot.send_message(
+                    order.user_id,
+                    "✅ <b>Оплата подтверждена!</b>\n\n"
+                    f"🧾 <b>Заказ:</b> #{order.order_id}\n"
+                    f"📍 <b>Страна:</b> {order.country_name}\n"
+                    f"📦 <b>Тариф:</b> {order.vm_name}\n"
+                    f"📌 <b>Статус:</b> {status_label(order.status)}\n\n"
+                    "👷 Администратор скоро выдаст данные от виртуальной машины.",
+                    reply_markup=main_menu_keyboard().as_markup(),
+                )
+            except Exception as exc:
+                logging.warning("Не удалось уведомить пользователя %s: %s", order.user_id, exc)
+
+            await notify_new_paid_order(bot, settings, storage_obj, order)
             return
 
-        storage_obj.update_order_status(order.payment_id, "paid_waiting_provision")
-        order = storage_obj.get_order(order.payment_id)
-        if order is None:
+        topup = storage_obj.get_balance_topup_by_platega_id(transaction_id)
+        if topup is None:
+            logging.warning(
+                "Platega confirmed: не найдено ни заказа, ни пополнения (tid=%s, payload=%s)",
+                transaction_id,
+                payload,
+            )
+            return
+
+        new_balance = storage_obj.credit_balance_topup(topup.topup_id)
+        if new_balance is None:
+            logging.info(
+                "Platega confirmed: пополнение %s уже обработано",
+                topup.topup_id,
+            )
             return
 
         try:
             await bot.send_message(
-                order.user_id,
-                "✅ <b>Оплата подтверждена!</b>\n\n"
-                f"🧾 <b>Заказ:</b> #{order.order_id}\n"
-                f"📍 <b>Страна:</b> {order.country_name}\n"
-                f"📦 <b>Тариф:</b> {order.vm_name}\n"
-                f"📌 <b>Статус:</b> {status_label(order.status)}\n\n"
-                "👷 Администратор скоро выдаст данные от виртуальной машины.",
+                topup.user_id,
+                "✅ <b>Баланс пополнен</b>\n\n"
+                f"➕ <b>Сумма:</b> {topup.amount_rub} ₽\n"
+                f"💰 <b>Новый баланс:</b> {new_balance} ₽\n\n"
+                "Теперь можно открыть «🖥 Мои серверы» и оплатить заказ с баланса.",
                 reply_markup=main_menu_keyboard().as_markup(),
             )
         except Exception as exc:
-            logging.warning("Не удалось уведомить пользователя %s: %s", order.user_id, exc)
+            logging.warning("Не удалось уведомить пользователя %s: %s", topup.user_id, exc)
 
-        await notify_new_paid_order(bot, settings, storage_obj, order)
+        await notify_balance_topup(
+            bot=bot,
+            settings=settings,
+            user_id=topup.user_id,
+            username=topup.username,
+            amount_rub=topup.amount_rub,
+            new_balance=new_balance,
+        )
 
     async def on_platega_canceled(transaction_id: str) -> None:
         order = storage_obj.get_order_by_platega_id(transaction_id)
-        if order is None:
+        if order is not None:
+            if order.status != "waiting_payment":
+                return
+            try:
+                await bot.send_message(
+                    order.user_id,
+                    "❌ <b>Платёж отменён или не прошёл</b>\n\n"
+                    f"🧾 Заказ #{order.order_id}\n\n"
+                    "Вы можете попробовать оплатить снова или обратиться в поддержку.",
+                    reply_markup=main_menu_keyboard().as_markup(),
+                )
+            except Exception as exc:
+                logging.warning("Не удалось уведомить об отмене пользователя %s: %s", order.user_id, exc)
             return
-        if order.status != "waiting_payment":
+
+        topup = storage_obj.get_balance_topup_by_platega_id(transaction_id)
+        if topup is None:
             return
+        storage_obj.cancel_balance_topup(topup.topup_id)
         try:
             await bot.send_message(
-                order.user_id,
-                "❌ <b>Платёж отменён или не прошёл</b>\n\n"
-                f"🧾 Заказ #{order.order_id}\n\n"
-                "Вы можете попробовать оплатить снова или обратиться в поддержку.",
+                topup.user_id,
+                "❌ <b>Пополнение отменено</b>\n\n"
+                f"➕ <b>Сумма:</b> {topup.amount_rub} ₽\n\n"
+                "Вы можете создать новую ссылку на оплату.",
                 reply_markup=main_menu_keyboard().as_markup(),
             )
         except Exception as exc:
-            logging.warning("Не удалось уведомить об отмене пользователя %s: %s", order.user_id, exc)
+            logging.warning("Не удалось уведомить об отмене пользователя %s: %s", topup.user_id, exc)
 
-    tasks = []
     try:
-        # Запускаем бота и webhook-сервер параллельно
         if settings.platega_merchant_id and settings.platega_secret:
             webhook_app = make_webhook_app(
                 merchant_id=settings.platega_merchant_id,
@@ -809,8 +981,7 @@ async def main() -> None:
             site = web.TCPSite(runner, "127.0.0.1", settings.webhook_port)
             await site.start()
             logging.info("Webhook-сервер запущен на порту %s", settings.webhook_port)
-            tasks.append(asyncio.create_task(dp.start_polling(bot)))
-            await asyncio.gather(*tasks)
+            await dp.start_polling(bot)
         else:
             logging.warning(
                 "PLATEGA_MERCHANT_ID / PLATEGA_SECRET не заданы — платежи через Platega отключены."

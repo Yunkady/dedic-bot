@@ -12,10 +12,10 @@ BASE_URL = "https://app.platega.io"
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class Plategalink:
     transaction_id: str
-    url: str
+    redirect: str
     status: str
     expires_in: str
 
@@ -40,7 +40,7 @@ class PlategaClient:
     ) -> Plategalink:
         body = {
             "paymentDetails": {
-                "amount": float(amount_rub),
+                "amount": amount_rub,
                 "currency": "RUB",
             },
             "description": description,
@@ -54,28 +54,37 @@ class PlategaClient:
                 json=body,
                 headers=self._headers,
             ) as resp:
+                text = await resp.text()
                 if resp.status != 200:
-                    text = await resp.text()
                     logger.error("Platega create_payment error %s: %s", resp.status, text)
                     raise RuntimeError(f"Platega API error {resp.status}: {text}")
-                data = await resp.json()
+                try:
+                    data = await resp.json()
+                except Exception as exc:
+                    logger.error("Platega create_payment bad JSON: %s | body=%s", exc, text)
+                    raise RuntimeError(f"Platega API returned invalid JSON: {text}") from exc
+
         return Plategalink(
-            transaction_id=data["transactionId"],
-            url=data["url"],
-            status=data["status"],
-            expires_in=data["expiresIn"],
+            transaction_id=str(data.get("transactionId") or data.get("id") or ""),
+            redirect=str(data.get("redirect") or data.get("url") or ""),
+            status=str(data.get("status") or ""),
+            expires_in=str(data.get("expiresIn") or ""),
         )
 
     async def get_payment_status(self, transaction_id: str) -> str:
-        """Возвращает статус транзакции (PENDING, CONFIRMED, CANCELED, CHARGEBACKED)."""
+        """Возвращает статус транзакции."""
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"{BASE_URL}/v2/transaction/{transaction_id}",
                 headers=self._headers,
             ) as resp:
+                text = await resp.text()
                 if resp.status != 200:
-                    text = await resp.text()
                     logger.error("Platega get_status error %s: %s", resp.status, text)
                     raise RuntimeError(f"Platega API error {resp.status}: {text}")
-                data = await resp.json()
+                try:
+                    data = await resp.json()
+                except Exception as exc:
+                    logger.error("Platega get_status bad JSON: %s | body=%s", exc, text)
+                    raise RuntimeError(f"Platega API returned invalid JSON: {text}") from exc
         return str(data.get("status", "UNKNOWN"))

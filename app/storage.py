@@ -36,6 +36,18 @@ class BalanceTx:
     created_at: datetime
 
 
+@dataclass(slots=True)
+class BalanceTopup:
+    topup_id: str
+    user_id: int
+    username: str | None
+    amount_rub: int
+    created_at: datetime
+    status: str
+    platega_transaction_id: str | None
+    confirmed_at: datetime | None
+
+
 class Storage:
     def __init__(self, db_path: str) -> None:
         self._db_path = Path(db_path)
@@ -85,12 +97,32 @@ class Storage:
                 note TEXT,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS balance_topups (
+                topup_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                amount_rub INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                platega_transaction_id TEXT UNIQUE,
+                confirmed_at TEXT
+            );
             """
         )
-        # Миграция: добавляем колонку если её нет (для существующих БД)
+
+        # Миграции для старых БД
         try:
             self._con.execute(
                 "ALTER TABLE orders ADD COLUMN platega_transaction_id TEXT"
+            )
+            self._con.commit()
+        except Exception:
+            pass
+
+        try:
+            self._con.execute(
+                "ALTER TABLE balance_topups ADD COLUMN confirmed_at TEXT"
             )
             self._con.commit()
         except Exception:
@@ -167,6 +199,7 @@ class Storage:
         if balance < amount_rub:
             self._con.execute("ROLLBACK")
             return False
+
         self._con.execute(
             "UPDATE users SET balance_rub = balance_rub - ? WHERE user_id = ?",
             (amount_rub, user_id),
@@ -249,6 +282,161 @@ class Storage:
             (platega_transaction_id, payment_id),
         )
         self._con.commit()
+
+    def create_balance_topup(
+        self,
+        topup_id: str,
+        user_id: int,
+        username: str | None,
+        amount_rub: int,
+        platega_transaction_id: str,
+        status: str = "waiting_payment",
+    ) -> None:
+        self.ensure_user(user_id, username)
+        self._con.execute(
+            """
+            INSERT INTO balance_topups(
+                topup_id, user_id, username, amount_rub,
+                created_at, status, platega_transaction_id, confirmed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                topup_id,
+                user_id,
+                username,
+                amount_rub,
+                datetime.utcnow().isoformat(),
+                status,
+                platega_transaction_id,
+            ),
+        )
+        self._con.commit()
+
+    def get_balance_topup(self, topup_id: str) -> BalanceTopup | None:
+        row = self._con.execute(
+            "SELECT * FROM balance_topups WHERE topup_id = ?",
+            (topup_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_balance_topup(row)
+
+    def get_balance_topup_by_platega_id(self, platega_transaction_id: str) -> BalanceTopup | None:
+        row = self._con.execute(
+            "SELECT * FROM balance_topups WHERE platega_transaction_id = ?",
+            (platega_transaction_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_balance_topup(row)
+
+    def set_balance_topup_platega_transaction_id(self, topup_id: str, platega_transaction_id: str) -> None:
+        self._con.execute(
+            "UPDATE balance_topups SET platega_transaction_id = ? WHERE topup_id = ?",
+            (platega_transaction_id, topup_id),
+        )
+        self._con.commit()
+
+    def update_balance_topup_status(self, topup_id: str, status: str) -> None:
+        if status not in ("waiting_payment", "confirmed", "canceled"):
+            raise ValueError("invalid topup status")
+        self._con.execute(
+            "UPDATE balance_topups SET status = ? WHERE topup_id = ?",
+            (status, topup_id),
+        )
+        self._con.commit()
+
+    def cancel_balance_topup(self, topup_id: str) -> bool:
+        self._con.execute("BEGIN IMMEDIATE")
+        row = self._con.execute(
+            "SELECT status FROM balance_topups WHERE topup_id = ?",
+            (topup_id,),
+        ).fetchone()
+        if row is None:
+            self._con.execute("ROLLBACK")
+            return False
+        if str(row["status"]) != "waiting_payment":
+            self._con.execute("ROLLBACK")
+            return False
+        self._con.execute(
+            """
+            UPDATE balance_topups
+            SET status = 'canceled'
+            WHERE topup_id = ?
+            """,
+            (topup_id,),
+        )
+        self._con.commit()
+        return True
+
+    def credit_balance_topup(self, topup_id: str) -> int | None:
+        """
+        Атомарно начисляет баланс по пополнению.
+        Возвращает новый баланс или None, если пополнение уже обработано / не найдено.
+        """
+        self._con.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._con.execute(
+                "SELECT * FROM balance_topups WHERE topup_id = ?",
+                (topup_id,),
+            ).fetchone()
+            if row is None or str(row["status"]) != "waiting_payment":
+                self._con.execute("ROLLBACK")
+                return None
+
+            user_id = int(row["user_id"])
+            username = row["username"]
+            amount_rub = int(row["amount_rub"])
+
+            self._con.execute(
+                """
+                INSERT INTO users(user_id, username, balance_rub)
+                VALUES (?, ?, 0)
+                ON CONFLICT(user_id) DO UPDATE SET username=excluded.username
+                """,
+                (user_id, username),
+            )
+            self._con.execute(
+                "UPDATE users SET balance_rub = balance_rub + ? WHERE user_id = ?",
+                (amount_rub, user_id),
+            )
+            user_row = self._con.execute(
+                "SELECT balance_rub FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            new_balance = int(user_row["balance_rub"]) if user_row else amount_rub
+
+            self._con.execute(
+                """
+                INSERT INTO balance_transactions(
+                    user_id, username, delta_rub, balance_after_rub, kind, note, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    username,
+                    amount_rub,
+                    new_balance,
+                    "topup",
+                    f"platega_topup:{topup_id}",
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            self._con.execute(
+                """
+                UPDATE balance_topups
+                SET status = 'confirmed', confirmed_at = ?
+                WHERE topup_id = ?
+                """,
+                (datetime.utcnow().isoformat(), topup_id),
+            )
+            self._con.commit()
+            return new_balance
+        except Exception:
+            self._con.execute("ROLLBACK")
+            raise
 
     def list_user_orders(self, user_id: int, limit: int = 10) -> list[DbOrder]:
         rows = self._con.execute(
@@ -444,4 +632,23 @@ class Storage:
             kind=str(row["kind"]),
             note=row["note"],
             created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _row_to_balance_topup(row: sqlite3.Row) -> BalanceTopup:
+        confirmed_at_raw = row["confirmed_at"] if "confirmed_at" in row.keys() else None
+        confirmed_at = (
+            datetime.fromisoformat(str(confirmed_at_raw))
+            if confirmed_at_raw
+            else None
+        )
+        return BalanceTopup(
+            topup_id=str(row["topup_id"]),
+            user_id=int(row["user_id"]),
+            username=row["username"],
+            amount_rub=int(row["amount_rub"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            status=str(row["status"]),
+            platega_transaction_id=row["platega_transaction_id"],
+            confirmed_at=confirmed_at,
         )
