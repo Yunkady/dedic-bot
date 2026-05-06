@@ -1,0 +1,18 @@
+[Unit]
+Description=Dedic Bot (Telegram) via uv
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/dedic-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/.local/bin/uv run python main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
