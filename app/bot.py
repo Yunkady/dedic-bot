@@ -442,7 +442,7 @@ async def ask_topup_amount(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(BuyVmState.waiting_topup_amount)
     await callback.message.edit_text(
         "➕ <b>Пополнение баланса</b>\n\n"
-        "Введите сумму целым числом (от <b>100</b> до <b>50000</b> ₽):"
+        "Введите сумму целым числом (от <b>10</b> до <b>50000</b> ₽):"
     )
     await callback.answer()
 
@@ -503,8 +503,8 @@ async def process_topup_amount(
         return
 
     amount_rub = int(raw_amount)
-    if amount_rub < 100 or amount_rub > 50000:
-        await message.answer("⚠️ Сумма должна быть от 100 до 50000 ₽.")
+    if amount_rub < 10 or amount_rub > 50000:
+        await message.answer("⚠️ Сумма должна быть от 10 до 50000 ₽.")
         return
 
     try:
