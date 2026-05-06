@@ -806,7 +806,7 @@ async def main() -> None:
             )
             runner = web.AppRunner(webhook_app)
             await runner.setup()
-            site = web.TCPSite(runner, "0.0.0.0", settings.webhook_port)
+            site = web.TCPSite(runner, "127.0.0.1", settings.webhook_port)
             await site.start()
             logging.info("Webhook-сервер запущен на порту %s", settings.webhook_port)
             tasks.append(asyncio.create_task(dp.start_polling(bot)))
