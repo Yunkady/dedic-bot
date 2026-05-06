@@ -12,6 +12,12 @@ class Settings:
     orders_group_id: int
     sqlite_db_path: str
     support_username: str
+    # Platega
+    platega_merchant_id: str
+    platega_secret: str
+    platega_return_url: str
+    platega_failed_url: str
+    webhook_port: int
 
 
 def get_settings() -> Settings:
@@ -21,4 +27,9 @@ def get_settings() -> Settings:
         orders_group_id=int(os.getenv("ORDERS_GROUP_ID", "0")),
         sqlite_db_path=os.getenv("SQLITE_DB_PATH", "data/bot.sqlite3"),
         support_username=os.getenv("SUPPORT_USERNAME", "").lstrip("@"),
+        platega_merchant_id=os.getenv("PLATEGA_MERCHANT_ID", ""),
+        platega_secret=os.getenv("PLATEGA_SECRET", ""),
+        platega_return_url=os.getenv("PLATEGA_RETURN_URL", "https://t.me/"),
+        platega_failed_url=os.getenv("PLATEGA_FAILED_URL", "https://t.me/"),
+        webhook_port=int(os.getenv("WEBHOOK_PORT", "8080")),
     )

@@ -26,6 +26,7 @@ from app.legal import (
     TERMS_LEAD_HTML,
     TERMS_OF_SERVICE_URL,
 )
+from app.payments import PlategaClient
 from app.storage import DbOrder, Storage
 
 
@@ -49,7 +50,7 @@ WELCOME_TEXT = (
     "пополнить внутренний баланс и отслеживать статус выдачи.\n\n"
     "✨ <b>Что можно сделать:</b>\n"
     "• 🌍 выбрать страну и подходящий тариф;\n"
-    "• 💰 оплатить заказ с внутреннего баланса (эквайринг подключим позже);\n"
+    "• 💰 оплатить заказ с баланса или банковской картой;\n"
     "• 🖥 смотреть свои заказы и получать данные доступа после выдачи;\n"
     "• 💬 написать в поддержку, если нужна помощь.\n\n"
     "Перед оплатой загляните в <b>«📚 Документы и поддержка»</b> — там политика "
@@ -219,7 +220,10 @@ def offers_keyboard(country_code: str) -> InlineKeyboardBuilder:
     return builder
 
 
-def payment_keyboard(payment_id: str, amount_rub: int) -> InlineKeyboardBuilder:
+def payment_keyboard(payment_id: str, amount_rub: int, pay_url: str | None = None) -> InlineKeyboardBuilder:
+    """
+    pay_url — ссылка на страницу Platega (если None — Platega не настроена).
+    """
     builder = InlineKeyboardBuilder()
     builder.add(
         InlineKeyboardButton(
@@ -227,10 +231,25 @@ def payment_keyboard(payment_id: str, amount_rub: int) -> InlineKeyboardBuilder:
             callback_data=f"paybalance:{payment_id}",
         )
     )
+    if pay_url:
+        builder.add(
+            InlineKeyboardButton(
+                text="💳 Оплатить картой",
+                url=pay_url,
+            )
+        )
+    builder.add(InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home"))
+    builder.adjust(1)
+    return builder
+
+
+def topup_keyboard(needed: int) -> InlineKeyboardBuilder:
+    """Клавиатура при нехватке баланса — кнопка пополнения на нужную сумму."""
+    builder = InlineKeyboardBuilder()
     builder.add(
         InlineKeyboardButton(
-            text="🔄 Проверить оплату",
-            callback_data=f"check:{payment_id}",
+            text=f"➕ Пополнить баланс (не хватает {needed} ₽)",
+            callback_data="balance:topup",
         )
     )
     builder.add(InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home"))
@@ -489,6 +508,7 @@ async def country_selected(callback: CallbackQuery, state: FSMContext) -> None:
 async def offer_selected(
     callback: CallbackQuery,
     storage: Storage,
+    settings: Settings,
 ) -> None:
     _, country_code, vm_id = callback.data.split(":")
     offer = find_offer(country_code, vm_id)
@@ -502,7 +522,7 @@ async def offer_selected(
         f"{offer.disk_gb} GB SSD / {offer.bandwidth_tb} TB трафика"
     )
 
-    payment_id = f"demo-{order_id}"
+    payment_id = f"order-{order_id}"
     order = DbOrder(
         order_id=order_id,
         user_id=callback.from_user.id,
@@ -517,20 +537,35 @@ async def offer_selected(
         created_at=datetime.now(timezone.utc),
         status="waiting_payment",
         provisioned_data=None,
+        platega_transaction_id=None,
     )
     storage.create_order(order)
 
+    # Создаём платежную ссылку Platega (если настроена)
+    pay_url: str | None = None
+    if settings.platega_merchant_id and settings.platega_secret:
+        try:
+            client = PlategaClient(settings.platega_merchant_id, settings.platega_secret)
+            link = await client.create_payment(
+                amount_rub=offer.price_rub,
+                description=f"Заказ #{order_id} — {offer.name} ({COUNTRIES[country_code]})",
+                return_url=settings.platega_return_url,
+                failed_url=settings.platega_failed_url,
+                payload=payment_id,  # передаём наш payment_id чтобы сопоставить в callback
+            )
+            storage.set_platega_transaction_id(payment_id, link.transaction_id)
+            pay_url = link.url
+        except Exception as exc:
+            logging.warning("Platega create_payment failed: %s", exc)
+
     await callback.message.edit_text(
         "🧾 <b>Заказ сформирован</b>\n\n"
-        "💳 Оплата банковской картой пока не подключена — используйте баланс "
-        "(пополните в главном меню) или, для проверки сценария, "
-        "«🔄 Проверить оплату» (тестовое подтверждение без реального платежа).\n\n"
         f"📍 <b>Страна:</b> {order.country_name}\n"
         f"📦 <b>Тариф:</b> {order.vm_name}\n"
         f"⚙️ <b>Характеристики:</b> {order.vm_specs}\n"
         f"💵 <b>Сумма:</b> {order.amount_rub} ₽\n\n"
-        "Выберите действие ниже 👇",
-        reply_markup=payment_keyboard(payment_id, order.amount_rub).as_markup(),
+        "Выберите способ оплаты 👇",
+        reply_markup=payment_keyboard(payment_id, order.amount_rub, pay_url).as_markup(),
     )
     await callback.answer()
 
@@ -555,12 +590,29 @@ async def pay_with_balance(
         await callback.answer("ℹ️ Этот заказ уже оплачен", show_alert=True)
         return
 
+    current_balance = storage.get_user_balance(callback.from_user.id)
+    if current_balance < order.amount_rub:
+        needed = order.amount_rub - current_balance
+        await callback.message.edit_text(
+            f"⚠️ <b>Недостаточно средств на балансе</b>\n\n"
+            f"💰 Ваш баланс: <b>{current_balance}</b> ₽\n"
+            f"💵 Стоимость заказа: <b>{order.amount_rub}</b> ₽\n"
+            f"📉 Не хватает: <b>{needed}</b> ₽\n\n"
+            "Пополните баланс и попробуйте снова.",
+            reply_markup=topup_keyboard(needed).as_markup(),
+        )
+        await callback.answer()
+        return
+
     if not storage.spend_user_balance(
         callback.from_user.id,
         order.amount_rub,
         kind="purchase",
         note=f"order:{order.order_id}",
     ):
+        # Повторная проверка (race condition)
+        current_balance = storage.get_user_balance(callback.from_user.id)
+        needed = order.amount_rub - current_balance
         await callback.answer("⚠️ Недостаточно средств на балансе", show_alert=True)
         return
 
@@ -581,58 +633,6 @@ async def pay_with_balance(
     )
     await notify_new_paid_order(bot, settings, storage, order)
     await callback.answer("✅ Оплачено с баланса")
-
-@router.callback_query(F.data.startswith("check:"))
-async def check_payment(
-    callback: CallbackQuery,
-    bot: Bot,
-    settings: Settings,
-    storage: Storage,
-    state: FSMContext,
-) -> None:
-    _, payment_id = callback.data.split(":")
-    order = storage.get_order(payment_id)
-    if order is None:
-        await callback.answer("⚠️ Заказ не найден", show_alert=True)
-        return
-
-    if order.status in {"paid_waiting_provision", "provisioned"}:
-        await callback.answer("✅ Оплата уже подтверждена")
-        return
-
-    if payment_id.startswith("demo-"):
-        status = "succeeded"
-    else:
-        await callback.answer(
-            "💳 Внешняя оплата сейчас недоступна. Оплатите с баланса или напишите в поддержку.",
-            show_alert=True,
-        )
-        return
-
-    if status != "succeeded":
-        await callback.answer("⏳ Платёж ещё не завершён")
-        return
-
-    storage.update_order_status(order.payment_id, "paid_waiting_provision")
-    order = storage.get_order(order.payment_id)
-    if order is None:
-        await callback.answer("⚠️ Заказ не найден", show_alert=True)
-        return
-    await state.set_state(BuyVmState.main_menu)
-    await callback.message.edit_text(
-        "✅ <b>Оплата подтверждена</b>\n\n"
-        f"🧾 <b>Заказ:</b> #{order.order_id}\n"
-        f"📍 <b>Страна:</b> {order.country_name}\n"
-        f"📦 <b>Тариф:</b> {order.vm_name}\n"
-        f"⚙️ <b>Характеристики:</b> {order.vm_specs}\n"
-        f"💵 <b>Сумма:</b> {order.amount_rub} ₽\n\n"
-        f"📌 <b>Статус:</b> {status_label(order.status)}\n\n"
-        "👷 Администратор скоро пришлёт данные для доступа — спасибо за ожидание!",
-        reply_markup=main_menu_keyboard().as_markup(),
-    )
-
-    await notify_new_paid_order(bot, settings, storage, order)
-    await callback.answer("✅ Оплата подтверждена")
 
 
 @router.message(
@@ -720,6 +720,9 @@ def validate_settings(settings: Settings) -> None:
 
 
 async def main() -> None:
+    from aiohttp import web
+    from app.webhook import make_webhook_app
+
     logging.basicConfig(level=logging.INFO)
     settings = get_settings()
     validate_settings(settings)
@@ -728,18 +731,93 @@ async def main() -> None:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    storage = Storage(settings.sqlite_db_path)
-    storage.init_schema()
+    storage_obj = Storage(settings.sqlite_db_path)
+    storage_obj.init_schema()
     dp = Dispatcher(storage=MemoryStorage())
 
     dp["settings"] = settings
-    dp["storage"] = storage
+    dp["storage"] = storage_obj
     dp.include_router(admin_router)
     dp.include_router(router)
+
+    async def on_platega_confirmed(transaction_id: str, payload: str) -> None:
+        """Вызывается webhook-сервером при статусе CONFIRMED от Platega."""
+        # payload содержит наш payment_id (мы передали его при создании платежа)
+        order = None
+        if payload:
+            order = storage_obj.get_order(payload)
+        if order is None:
+            # Запасной вариант — ищем по platega_transaction_id
+            order = storage_obj.get_order_by_platega_id(transaction_id)
+        if order is None:
+            logging.warning("Platega confirmed: заказ не найден (tid=%s, payload=%s)", transaction_id, payload)
+            return
+        if order.status != "waiting_payment":
+            logging.info("Platega confirmed: заказ %s уже обработан (status=%s)", order.payment_id, order.status)
+            return
+
+        storage_obj.update_order_status(order.payment_id, "paid_waiting_provision")
+        order = storage_obj.get_order(order.payment_id)
+        if order is None:
+            return
+
+        try:
+            await bot.send_message(
+                order.user_id,
+                "✅ <b>Оплата подтверждена!</b>\n\n"
+                f"🧾 <b>Заказ:</b> #{order.order_id}\n"
+                f"📍 <b>Страна:</b> {order.country_name}\n"
+                f"📦 <b>Тариф:</b> {order.vm_name}\n"
+                f"📌 <b>Статус:</b> {status_label(order.status)}\n\n"
+                "👷 Администратор скоро выдаст данные от виртуальной машины.",
+                reply_markup=main_menu_keyboard().as_markup(),
+            )
+        except Exception as exc:
+            logging.warning("Не удалось уведомить пользователя %s: %s", order.user_id, exc)
+
+        await notify_new_paid_order(bot, settings, storage_obj, order)
+
+    async def on_platega_canceled(transaction_id: str) -> None:
+        order = storage_obj.get_order_by_platega_id(transaction_id)
+        if order is None:
+            return
+        if order.status != "waiting_payment":
+            return
+        try:
+            await bot.send_message(
+                order.user_id,
+                "❌ <b>Платёж отменён или не прошёл</b>\n\n"
+                f"🧾 Заказ #{order.order_id}\n\n"
+                "Вы можете попробовать оплатить снова или обратиться в поддержку.",
+                reply_markup=main_menu_keyboard().as_markup(),
+            )
+        except Exception as exc:
+            logging.warning("Не удалось уведомить об отмене пользователя %s: %s", order.user_id, exc)
+
+    tasks = []
     try:
-        await dp.start_polling(bot)
+        # Запускаем бота и webhook-сервер параллельно
+        if settings.platega_merchant_id and settings.platega_secret:
+            webhook_app = make_webhook_app(
+                merchant_id=settings.platega_merchant_id,
+                secret=settings.platega_secret,
+                on_confirmed=on_platega_confirmed,
+                on_canceled=on_platega_canceled,
+            )
+            runner = web.AppRunner(webhook_app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", settings.webhook_port)
+            await site.start()
+            logging.info("Webhook-сервер запущен на порту %s", settings.webhook_port)
+            tasks.append(asyncio.create_task(dp.start_polling(bot)))
+            await asyncio.gather(*tasks)
+        else:
+            logging.warning(
+                "PLATEGA_MERCHANT_ID / PLATEGA_SECRET не заданы — платежи через Platega отключены."
+            )
+            await dp.start_polling(bot)
     finally:
-        storage.close()
+        storage_obj.close()
 
 
 if __name__ == "__main__":

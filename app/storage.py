@@ -21,6 +21,7 @@ class DbOrder:
     created_at: datetime
     status: str
     provisioned_data: str | None
+    platega_transaction_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -65,7 +66,8 @@ class Storage:
                 amount_rub INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL,
-                provisioned_data TEXT
+                provisioned_data TEXT,
+                platega_transaction_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS group_order_messages (
@@ -85,7 +87,14 @@ class Storage:
             );
             """
         )
-        self._con.commit()
+        # Миграция: добавляем колонку если её нет (для существующих БД)
+        try:
+            self._con.execute(
+                "ALTER TABLE orders ADD COLUMN platega_transaction_id TEXT"
+            )
+            self._con.commit()
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._con.close()
@@ -192,9 +201,10 @@ class Storage:
             """
             INSERT INTO orders(
                 payment_id, order_id, user_id, username, country_code, country_name,
-                vm_id, vm_name, vm_specs, amount_rub, created_at, status, provisioned_data
+                vm_id, vm_name, vm_specs, amount_rub, created_at, status,
+                provisioned_data, platega_transaction_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order.payment_id,
@@ -210,6 +220,7 @@ class Storage:
                 order.created_at.isoformat(),
                 order.status,
                 order.provisioned_data,
+                order.platega_transaction_id,
             ),
         )
         self._con.commit()
@@ -222,6 +233,22 @@ class Storage:
         if row is None:
             return None
         return self._row_to_order(row)
+
+    def get_order_by_platega_id(self, platega_transaction_id: str) -> DbOrder | None:
+        row = self._con.execute(
+            "SELECT * FROM orders WHERE platega_transaction_id = ?",
+            (platega_transaction_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_order(row)
+
+    def set_platega_transaction_id(self, payment_id: str, platega_transaction_id: str) -> None:
+        self._con.execute(
+            "UPDATE orders SET platega_transaction_id = ? WHERE payment_id = ?",
+            (platega_transaction_id, payment_id),
+        )
+        self._con.commit()
 
     def list_user_orders(self, user_id: int, limit: int = 10) -> list[DbOrder]:
         rows = self._con.execute(
@@ -387,6 +414,8 @@ class Storage:
 
     @staticmethod
     def _row_to_order(row: sqlite3.Row) -> DbOrder:
+        cols = row.keys()
+        platega_tid = row["platega_transaction_id"] if "platega_transaction_id" in cols else None
         return DbOrder(
             order_id=str(row["order_id"]),
             user_id=int(row["user_id"]),
@@ -401,6 +430,7 @@ class Storage:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             status=str(row["status"]),
             provisioned_data=row["provisioned_data"],
+            platega_transaction_id=platega_tid,
         )
 
     @staticmethod
